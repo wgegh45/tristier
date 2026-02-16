@@ -1,0 +1,534 @@
+アンサンブルスコアリングの仕組み
+
+ステップ1: 各モデルの予測を収集
+8つのモデルがそれぞれTOP10の候補を出力します。
+
+ステップ2: フィルタリング（3つの条件）
+各候補に対して以下の条件でフィルタリング:
+
+条件1: MAX_RANK_TO_CONSIDER = 10
+意味: 各モデルの予測で10位以内の候補のみ評価対象
+効果: 11位以降は無視される（信頼性が低いため）
+for rank, candidate in enumerate(candidates, start=1):
+    if rank > MAX_RANK_TO_CONSIDER:  # 11位以降は無視
+        break
+        
+条件2: MIN_PROBABILITY_THRESHOLD = 0.015
+意味: 確率が1.5%未満の候補は除外
+効果: 極端に低確率の候補を排除
+prob = candidate['probability']
+if prob < MIN_PROBABILITY_THRESHOLD:  # 1.5%未満は無視
+    continue
+**例:**
+M-b: 10位:闷(0.0024) → 0.24% < 1.5% なので除外
+B-w: 10位:美(0.0010) → 0.10% < 1.5% なので除外
+
+
+条件3: MIN_SUPPORT = 2
+意味: 2つ以上のモデルが支持した候補のみ採用
+効果: 1つのモデルだけの特異な予測を排除
+# 各トークンを支持したモデル数をカウント
+token_scores[token]["models"].append((model_name, rank, prob))
+
+# フィルタリング
+filtered_tokens = {
+    token: data 
+    for token, data in token_scores.items() 
+    if len(data["models"]) >= MIN_SUPPORT  # 2モデル以上
+}
+**例:**
+「好」: 8モデルが支持 → 採用 ✓
+「晴」: 3モデルが支持 → 採用 ✓
+「糟」: 1モデルのみ → 除外 ✗
+
+
+
+ステップ3: スコア計算（3方式）
+方式A: 順位ベース (rank)
+順位に応じたスコアを合計
+python# exponential方式の場合
+1位: 10.00点
+2位:  7.50点
+3位:  5.62点
+4位:  4.22点
+...
+
+# 例: 「好」のスコア計算
+M-b: 1位 → 10.00点
+M-l: 1位 → 10.00点
+B-w: 1位 → 10.00点
+R-w: 3位 →  5.62点
+E-b: 2位 →  7.50点
+E-l: 3位 →  5.62点
+G-b: 2位 →  7.50点
+B-b: 1位 → 10.00点
+-----------------------
+合計: 66.24点
+
+
+方式B: 確率ベース (probability)
+各モデルの確率を平均
+python# 例: 「好」の確率計算
+(0.6233 + 0.7456 + 0.9686 + 0.2146 + 0.3173 + 0.1339 + 0.3089 + 0.9228) / 8 = 0.5294
+
+
+方式C: ハイブリッド (hybrid)
+順位スコア × 確率 の合計
+python# 例: 「好」のハイブリッドスコア
+M-b: 10.00 × 0.6233 =  6.233
+M-l: 10.00 × 0.7456 =  7.456
+B-w: 10.00 × 0.9686 =  9.686
+R-w:  5.62 × 0.2146 =  1.206
+E-b:  7.50 × 0.3173 =  2.380
+E-l:  5.62 × 0.1339 =  0.753
+G-b:  7.50 × 0.3089 =  2.317
+B-b: 10.00 × 0.9228 =  9.228
+---------------------------------
+合計: 39.259点
+
+
+
+
+
+マスクグループの補完方法
+
+1. 通常MASK vs カスタムMASKグループの違い
+
+通常MASK（[MASK]）
+入力: 今天天气很[MASK]。
+処理: 1行のみで予測
+
+カスタムMASKグループ（[MASK_A], [MASK_B], [MASK_C]など）
+入力: 
+  他[MASK_A]我去看电影。
+  我[MASK_A]你明天一起去。
+処理: 複数行を統合して予測
+
+
+2. カスタムMASKグループの処理フロー
+
+ステップ1: マスクの検出と分類
+コード（行1180-1220付近）:
+
+# [MASK_XXX]を検出
+custom_matches = re.findall(r'\[MASK_([A-Z0-9_]+)\]', line)
+
+# 例: 
+# 行2: 他[MASK_A]我去看电影。 → mask_type = 'A'
+# 行3: 我[MASK_A]你明天一起去。 → mask_type = 'A'
+
+同じmask_typeを持つ行をグループ化:
+mask_groups['A'] = [
+    {'line_num': 2, 'original': '他[MASK_A]我去看电影。', 'processed': '他[MASK]我去看电影。'},
+    {'line_num': 3, 'original': '我[MASK_A]你明天一起去。', 'processed': '我[MASK]你明天一起去。'}
+]
+
+
+ステップ2: 複数行の連結
+コード（行1390-1400付近）:
+
+# 複数行を改行で連結
+combined_text = '\n'.join(entry['processed'] for entry in entries)
+
+# 例:
+# "他[MASK]我去看电影。\n我[MASK]你明天一起去。"
+
+
+ステップ3: マスクの統合（重要）
+問題: 2つの[MASK]があると、モデルは2つの異なる予測をしてしまう
+解決策: 最初の[MASK]だけ残し、残りを削除
+コード（行1400-1440付近）:
+
+# 最初の[MASK]だけ残し、残りを削除
+mask_positions = []
+for i in range(len(combined_text) - 5):
+    if combined_text[i:i+6] == '[MASK]':
+        mask_positions.append(i)
+
+if mask_positions:
+    parts = []
+    last_end = 0
+    for idx, pos in enumerate(mask_positions):
+        if idx == 0:
+            # 最初のMASKは残す
+            parts.append(combined_text[last_end:pos+6])
+            last_end = pos + 6
+        else:
+            # 2つ目以降のMASKは削除（[MASK]を含めずに追加）
+            parts.append(combined_text[last_end:pos])
+            last_end = pos + 6
+    parts.append(combined_text[last_end:])
+    combined_processed_single = ''.join(parts)
+
+**変換例:**
+変換前: 他[MASK]我去看电影。\n我[MASK]你明天一起去。
+      ↓
+変換後: 他[MASK]我去看电影。\n我你明天一起去。
+         ↑残す              ↑削除
+
+
+ステップ4: 統一文脈での予測
+モデルへの入力:
+
+combined_processed_single = "他[MASK]我去看电影。\n我你明天一起去。"
+
+# 各モデルで予測
+all_model_predictions = {}
+for model_name, model in models.items():
+    predictions = model.predict_masks(
+        combined_processed_single, 
+        use_full_context=USE_FULL_LINE_CONTEXT  # True
+    )
+    all_model_predictions[model_name] = predictions
+```
+
+**`USE_FULL_LINE_CONTEXT = True`の効果:**
+- モデルは**2行全体**を文脈として使用
+- 「他」と「我」の関係、「去看电影」と「明天一起去」の関係を考慮
+
+---
+
+## 3. なぜ統一文脈が重要か
+
+### 例: MASK_Aグループ
+
+**入力:**
+```
+他[MASK_A]我去看电影。
+我[MASK_A]你明天一起去。
+```
+
+**統合後の文脈:**
+```
+他[MASK]我去看电影。
+我你明天一起去。
+```
+
+**モデルの判断:**
+- 「他___我去看电影」→ 動詞が必要
+- 「我你明天一起去」→ 2行目も同じ動詞構造
+- **両方の文脈から**「约」「叫」「说」などの動詞が適切と判断
+
+**結果:**
+```
+1位: 说 (13.105点) ← 8モデルが支持
+2位: 带 (10.398点) ← 7モデルが支持
+3位: 叫 (7.894点) ← 8モデルが支持
+```
+
+---
+
+## 4. 通常MASKとの比較
+
+### 通常MASK（1行のみ）
+```
+入力: 今天天气很[MASK]。
+
+文脈: この1行のみ
+予測: 「好」「热」「冷」など（天気の形容詞）
+```
+
+### カスタムMASKグループ（複数行）
+```
+入力:
+  我[MASK]喜欢[MASK_C]足球。
+  她[MASK_C]得很快。
+
+統合: 我[MASK]喜欢足球。
+     她得很快。
+
+文脈: 2行の関係を考慮
+予測: 「很」（両方の文で副詞として機能）
+
+
+
+5. 統一候補生成の詳細（オプション）
+コード（行1260-1390付近）には高度な処理が含まれていますが、現在は使用されていません:
+
+# ★現在の簡易版
+if len(entries) >= 2 or total_masks >= 2:
+    # 最初のMASKだけ残して予測
+    combined_processed_single = '...'
+    predictions = model.predict_masks(combined_processed_single, ...)
+    
+    
+将来の拡張:
+各MASK位置で候補プールを作成
+文ペア評価（Pseudo Log-Likelihood）で再スコアリング
+より精度の高い統一候補を生成
+
+現在はシンプルな統合方式で十分な精度を達成しています。
+
+
+カスタムMASKグループの利点:
+
+複数の文の関係を考慮
+文脈が豊富なため、より適切な候補を予測
+同じ単語が複数箇所で使われるパターンに強い
+
+
+
+文ペア評価方式（PLL: Pseudo Log-Likelihood）
+
+1. PLLとは何か基本概念PLL (Pseudo Log-Likelihood) = 「文全体の自然さ」を数値化する手法原理:
+
+マスク言語モデル（MLM）を使って、文中の各トークンが「その位置にあるべき確率」を計算
+すべてのトークンの確率を掛け合わせる（対数空間では加算）
+値が大きいほど「自然な文」
+
+
+2. PLLスコアの計算方法
+ステップバイステップ
+例文: 「他约我去看电影。」
+ステップ1: 各トークンを順番にマスク
+
+トークン1: [MASK]约我去看电影。
+トークン2: 他[MASK]我去看电影。
+トークン3: 他约[MASK]去看电影。
+トークン4: 他约我[MASK]看电影。
+トークン5: 他约我去[MASK]电影。
+トークン6: 他约我去看[MASK]。
+トークン7: 他约我去看电影[MASK]
+
+
+ステップ2: 各位置でモデルに予測させる
+
+# 位置1の予測
+inputs = tokenizer("[MASK]约我去看电影。", return_tensors="pt")
+outputs = model(**inputs)
+logits = outputs.logits[0, 1]  # [MASK]の位置
+
+# 正解トークン「他」の確率を取得
+prob_他 = softmax(logits)[token_id_他]
+log_prob_他 = log(prob_他)  # 例: -0.5
+
+
+ステップ3: すべての位置のlog確率を合計
+
+log_prob_他 = -0.5
+log_prob_约 = -0.3
+log_prob_我 = -0.2
+log_prob_去 = -0.4
+log_prob_看 = -0.3
+log_prob_电 = -0.6
+log_prob_影 = -0.7
+--------------------------------
+PLL_score = -3.0
+
+
+値の意味:
+
+高い値（-1.0など）: 非常に自然な文
+中間値（-5.0など）: やや自然
+低い値（-20.0など）: 不自然な文
+
+
+3. 実装（コード内での処理）
+evaluate_mlm_score_fast関数
+
+def evaluate_mlm_score_fast(self, text, skip_positions=None):
+    """文全体のMLMスコアを計算"""
+    
+    # 入力をトークン化
+    inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+    input_ids = inputs["input_ids"].clone()
+    
+    # 例: 「他约我去看电影。」
+    # input_ids = [101, 872, 5276, 2769, 1343, 4692, 4510, 2512, 511, 102]
+    #              [CLS] 他   约   我   去   看   电   影   。  [SEP]
+    
+    # 特殊トークンをスキップ
+    special_ids = {cls_id, sep_id, pad_id}
+    
+    # 評価対象の位置を収集
+    eval_positions = []
+    for i in range(input_ids.size(1)):
+        token_id = input_ids[0, i].item()
+        if token_id not in special_ids:
+            eval_positions.append(i)
+    
+    # 例: eval_positions = [1, 2, 3, 4, 5, 6, 7, 8]
+    #                      他  约  我  去  看  电  影  。
+    
+    # バッチマスク作成（各位置を1つずつマスク）
+    batch_input_ids = input_ids.repeat(len(eval_positions), 1)
+    
+    for idx, pos in enumerate(eval_positions):
+        batch_input_ids[idx, pos] = self.tokenizer.mask_token_id
+    
+    # 例:
+    # batch[0]: [101, [MASK], 5276, 2769, 1343, 4692, 4510, 2512, 511, 102]
+    # batch[1]: [101, 872, [MASK], 2769, 1343, 4692, 4510, 2512, 511, 102]
+    # batch[2]: [101, 872, 5276, [MASK], 1343, 4692, 4510, 2512, 511, 102]
+    # ...
+    
+    # 一度にすべてのマスク位置を予測
+    with torch.no_grad():
+        outputs = self.model(batch_input_ids)
+        logits = outputs.logits
+    
+    # 各位置のスコア計算
+    total_score = 0.0
+    for idx, pos in enumerate(eval_positions):
+        original_token = input_ids[0, pos].item()  # 正解トークン
+        token_logits = logits[idx, pos]
+        prob = torch.softmax(token_logits, dim=0)[original_token].item()
+        total_score += math.log(prob + 1e-12)
+    
+    # 例:
+    # 他: log(0.65) = -0.43
+    # 约: log(0.73) = -0.31
+    # 我: log(0.82) = -0.20
+    # 去: log(0.68) = -0.39
+    # 看: log(0.71) = -0.34
+    # 电: log(0.54) = -0.62
+    # 影: log(0.49) = -0.71
+    # 。: log(0.91) = -0.09
+    # total_score = -3.09
+    
+    return total_score
+
+
+4. 文ペア評価での使用方法
+候補ごとにPLLスコアを計算
+
+# 入力文（2行）
+文1: 他[MASK_A]我去看电影。
+文2: 我[MASK_A]你明天一起去。
+
+# 候補リスト
+candidates = ['约', '说', '叫', '带', ...]
+
+# 各候補でPLLスコア計算
+for token in candidates:
+    # 候補を埋め込んだ文を作成
+    filled_text1 = "他约我去看电影。"
+    filled_text2 = "我约你明天一起去。"
+    combined = filled_text1 + "\n" + filled_text2
+    
+    # PLLスコア計算
+    pll_score = eval_model.evaluate_mlm_score_fast(combined)
+    # 例: pll_score = -6.5
+```
+
+---
+
+## 5. 具体例での計算
+
+### MASK_Aグループ
+```
+文1: 他[MASK_A]我去看电影。
+文2: 我[MASK_A]你明天一起去。
+
+
+候補「约」のPLLスコア
+
+filled = "他约我去看电影。\n我约你明天一起去。"
+
+# 文1のスコア: 他约我去看电影。
+他: -0.43
+约: -0.31  ← 予測: 約85%の確率で「约」
+我: -0.20
+去: -0.39
+看: -0.34
+电: -0.62
+影: -0.71
+。: -0.09
+小計: -3.09
+
+# 文2のスコア: 我约你明天一起去。
+我: -0.22
+约: -0.28  ← 予測: 約88%の確率で「约」
+你: -0.19
+明: -0.41
+天: -0.35
+一: -0.52
+起: -0.48
+去: -0.37
+。: -0.08
+小計: -2.90
+
+合計PLL: -6.00  ← 高スコア（自然）
+
+
+候補「说」のPLLスコア
+
+filled = "他说我去看电影。\n我说你明天一起去。"
+
+# 文1のスコア: 他说我去看电影。
+他: -0.43
+说: -0.65  ← 予測: 約52%の確率で「说」（やや低い）
+我: -0.25
+去: -0.42
+看: -0.36
+电: -0.63
+影: -0.72
+。: -0.10
+小計: -3.56
+
+# 文2のスコア: 我说你明天一起去。
+我: -0.22
+说: -2.10  ← 予測: 約12%の確率で「说」（非常に低い！）
+你: -0.30
+明: -0.55
+天: -0.42
+一: -0.58
+起: -0.53
+去: -0.45
+。: -0.12
+小計: -5.27
+
+合計PLL: -8.83  ← 低スコア（不自然）
+```
+
+**比較:**
+```
+約: -6.00  ← 両文で自然
+说: -8.83  ← 文2で不自然
+```
+
+---
+
+## 6. 問題点（なぜ失敗したか）
+
+### MASK_Cグループの例
+```
+文1: 我[MASK]喜欢足球。
+文2: 她[MASK]得很快。
+
+
+**比較:**
+```
+走: -14.00  ← 文1が極端に悪いが、文2が良い
+也: -11.65  ← 文1が良いが、文2が悪い
+很: -8.96   ← 両方やや悪い
+
+
+問題:
+PLLは合計値なので、「片方が極端に良い」候補が「両方そこそこ」候補より高スコアになる可能性がある。
+
+7. まとめ
+PLLの仕組み
+
+文中の各トークンを順番にマスク
+モデルが「正解トークン」を予測する確率を計算
+すべての確率の対数を合計
+値が高いほど「自然な文」
+
+なぜ失敗したか
+
+合計スコア方式のため、「片方が極端に良い + 片方が極端に悪い」が「両方そこそこ」より高スコアになる
+特に文の構造が異なる場合（MASK_C）で顕著
+最小値方式（min(文1, 文2)）の方が適切だったかもしれない
+
+結論
+シンプル統合方式の方が優れている理由:
+
+複数の信頼できるモデルの「直接予測」を使用
+文ペア評価の複雑な計算が不要
+結果がより自然
+
+
+
+
+
